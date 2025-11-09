@@ -18,8 +18,17 @@ import base64
 import traceback
 from collections import Counter
 from collections import defaultdict
+import google.generativeai as genai
+from dotenv import load_dotenv
 
 
+load_dotenv()
+
+api_key = os.environ.get("GEMINI_API_KEY")
+genai.configure(api_key=api_key)
+model = genai.GenerativeModel(model_name='gemini-2.5-flash')
+
+    
 
 app = Flask(__name__)
 CORS(app)
@@ -89,13 +98,19 @@ HTML_TEMPLATE = """
     .top-bar { display:flex; justify-content:space-between; align-items:center; padding:10px; border-bottom:1px solid #ccc; }
     label { margin-right:6px; }
     select, input[type="date"] { margin-right:10px; }
+    .help-button { position: fixed; top: 10px; right: 10px; z-index: 1000; }
+    .help-modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: flex; justify-content: center; align-items: center; z-index: 999; }
+    .help-modal-content { background: white; padding: 20px; border-radius: 5px; width: 500px; max-height: 80vh; overflow-y: auto; display: flex; flex-direction: column; }
+    .help-modal-chat { flex-grow: 1; margin-bottom: 10px; }
+    .help-modal-input { display: flex; }
+    .help-modal-input input { flex-grow: 1; }
   </style>
 </head>
 <body>
   <div id="root"></div>
   {% raw %}
   <script type="text/babel">
-    const { useState, useEffect } = React;
+    const { useState, useEffect, useRef } = React;
     
     function usePersistentState(key, defaultValue) {
         const [state, setState] = useState(() => {
@@ -1246,6 +1261,107 @@ HTML_TEMPLATE = """
     };
 
 
+    const HelpModal = ({ show, onClose }) => {
+        const [conversation, setConversation] = useState([]);
+        const [input, setInput] = useState("");
+        const [loading, setLoading] = useState(false);
+        const chatEndRef = useRef(null);
+
+        useEffect(() => {
+            chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        }, [conversation]);
+
+        const handleSend = async () => {
+            if (!input.trim() || loading) return;
+
+            const userMessage = { role: 'user', text: input };
+            // Use the optimistic update state where we add the user message
+            const historyPayload = [...conversation, userMessage]; 
+            
+            setConversation(prev => [...prev, userMessage]);
+            setInput("");
+            setLoading(true);
+
+            try {
+                const pageContent = document.body.innerText;
+                const response = await fetch('/ask_gemini', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        content: pageContent,
+                        history: historyPayload
+                    }),
+                });
+                
+                // --- FIX IS HERE ---
+                // Always parse the JSON body, regardless of the HTTP status
+                const data = await response.json();
+                
+                if (response.ok) {
+                    // SUCCESS: HTTP Status 200-299. We expect the 'response' key.
+                    const botMessage = { role: 'bot', text: data.response };
+                    setConversation(prev => [...prev, botMessage]);
+                } else {
+                    // ERROR: HTTP Status 4xx or 5xx. We expect the 'error' key from Flask.
+                    console.error("Server Error:", data.error);
+                    const errorMessage = { 
+                        role: 'bot', 
+                        text: data.error || "An unknown server error occurred." // Fallback text
+                    };
+                    setConversation(prev => [...prev, errorMessage]);
+                }
+                // --- END OF FIX ---
+                
+            } catch (error) {
+                console.error("Error contacting Gemini API:", error);
+                // This catch block handles network errors or complete JSON parsing failures
+                const errorMessage = { role: 'bot', text: "Sorry, I'm having trouble connecting. Please try again later." };
+                setConversation(prev => [...prev, errorMessage]);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        if (!show) return null;
+
+        return (
+            <div className="help-modal-overlay" onClick={onClose}>
+                <div className="help-modal-content" onClick={e => e.stopPropagation()}>
+                    <div className="help-modal-chat">
+                        {conversation.map((msg, index) => (
+                            <div key={index} style={{ textAlign: msg.role === 'user' ? 'right' : 'left', margin: '5px 0' }}>
+                                <p style={{ background: msg.role === 'user' ? '#dcf8c6' : '#f1f0f0', padding: '10px', borderRadius: '10px', display: 'inline-block' }}>
+                                    {msg.text}
+                                </p>
+                            </div>
+                        ))}
+                        {loading && (
+                            <div style={{ textAlign: 'left', margin: '5px 0' }}>
+                                <p style={{ background: '#f1f0f0', padding: '10px', borderRadius: '10px', display: 'inline-block' }}>
+                                    Thinking...
+                                </p>
+                            </div>
+                        )}
+                        <div ref={chatEndRef} />
+                    </div>
+                    <div className="help-modal-input">
+                        <input
+                            type="text"
+                            value={input}
+                            onChange={e => setInput(e.target.value)}
+                            onKeyPress={e => e.key === 'Enter' && handleSend()}
+                            placeholder="Ask about the results on the page..."
+                            disabled={loading}
+                        />
+                        <button onClick={handleSend} disabled={loading || !input.trim()}>
+                            {loading ? '...' : 'Send'}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
     // Application
     const App = () => {
       const [activeTab, setActiveTab] = React.useState("File Upload");
@@ -1253,6 +1369,7 @@ HTML_TEMPLATE = """
       const [targetVariable, setTargetVariable] = React.useState("");
       const [modelBuilt, setModelBuilt] = React.useState(false);
       const [modelTargets, setModelTargets] = React.useState([]);
+      const [showHelp, setShowHelp] = React.useState(false);
 
 
       const handleModelBuilt = (targets) => {
@@ -1282,6 +1399,8 @@ HTML_TEMPLATE = """
               {modelBuilt ? <strong>Model built</strong> : null}
             </div>
           </div>
+          <button className="help-button" onClick={() => setShowHelp(true)}>HELP</button>
+          <HelpModal show={showHelp} onClose={() => setShowHelp(false)} />
 
 
           <div style={{ padding: 12 }}>
@@ -2977,8 +3096,6 @@ def bestsellers_plot():
     img_b64 = base64.b64encode(buf.read()).decode("utf-8")
     buf.close()
     plt.close("all")
-
-    # --- 6. Final Response ---
     
     return jsonify({
         "image": img_b64,
@@ -2986,7 +3103,49 @@ def bestsellers_plot():
         "ingredient_table": ingredient_data,
         "frequency_table": frequency_table_data # <-- NEW DATA FIELD
     })
-    
 
+@app.route('/ask_gemini', methods=['POST'])
+def ask_gemini():
+    # --- FIX 1: Safety check for uninitialized model ---
+    if model is None:
+        return jsonify({'error': "Server error: The Gemini API failed to initialize at startup. Check your API key."}), 500
+    # ----------------------------------------------------
+    
+    data = request.get_json()
+    page_content = data.get('content', '')
+    history = data.get('history', [])
+
+    # Format the history for the model
+    chat_history = []
+    for message in history:
+        role = 'user' if message['role'] == 'user' else 'model'
+        # Ensures 'parts' contains a dictionary with the 'text' key 
+        chat_history.append({'role': role, 'parts': [{'text': message['text']}]}) 
+
+    # Remove the last user message from history as it's the current prompt
+    prompt = "Hello."
+    if chat_history and chat_history[-1]['role'] == 'user':
+        try:
+            prompt_part = chat_history.pop()['parts'][0]
+            prompt = prompt_part.get('text', prompt) if isinstance(prompt_part, dict) else str(prompt_part)
+        except Exception:
+            pass 
+
+    try:
+        chat = model.start_chat(history=chat_history)
+        # --- FIX 3: Splitting the long string into multiple lines inside parentheses ---
+        response = chat.send_message(
+            "Based on the following content from the webpage, please answer the user's question. "
+            "Keep your response to a single paragraph unless the user asks for more detail. "
+            f"Webpage content: ```{page_content}```\n\n"
+            f"User question: {prompt}"
+        )
+        # -----------------------------------------------------------------------------
+        return jsonify({'response': response.text})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+    
 if __name__ == "__main__":
     app.run(debug=True, port = 5001)
