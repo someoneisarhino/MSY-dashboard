@@ -1279,7 +1279,6 @@ def predict_next_month_usage():
     month_num = month_map.get(month_to_predict_str.lower())
     
     # Map selected month string to actual month name in the dataset (for test_df lookup)
-    # Corrected months for dataset lookup based on user input (Aug -> August, Sept -> September, etc.)
     month_actual_name_map = {
         "june": "June", "july": "July", "aug": "August", "sept": "September", "oct": "October", "nov": "November"
     }
@@ -1297,14 +1296,13 @@ def predict_next_month_usage():
         "cilantro", "whiteonion", "peasg", "carrotg", "bokchoyg", "tapiocastarch"
     ]
     
-    # 1. TEMPORARILY NORMALIZE COLUMN NAMES
+
+    col_name_map_forward = {col: normalize_text(col) for col in item.columns}
     
-    # Create a mapping of old column names to new normalized column names
-    col_name_map = {col: normalize_text(col) for col in item.columns}
+    col_name_map_reverse = {v: k for k, v in col_name_map_forward.items()}
     
-    # Apply temporary rename to a DEEP COPY of the item DataFrame. 
     df_pred_base = item.copy()
-    df_pred_base.columns = df_pred_base.columns.map(col_name_map)
+    df_pred_base.columns = df_pred_base.columns.map(col_name_map_forward)
     
     # Ensure 'month' column is handled consistently
     if 'month' not in df_pred_base.columns:
@@ -1533,17 +1531,40 @@ def predict_next_month_usage():
     # Replace NaN actuals with 0 for plotting consistency
     plot_data['Actual Usage'] = plot_data['Actual Usage'].fillna(0)
     
+    # --- FIX: Rename Index to Unnormalized Names ---
+    
+    # Create the mapping: Original Name -> Normalized Name
+    col_name_map_forward = {col: normalize_text(col) for col in item.columns}
+    
+    # Create the REVERSE mapping: Normalized Name -> Original Name (for plotting)
+    # This is the key to using the unnormalized names for plotting later.
+    col_name_map_reverse = {v: k for k, v in col_name_map_forward.items()}
+
+    # 1. Create a dictionary to map normalized targets (the current index) back to their original names
+    # Only map the targets we actually processed
+    plot_label_map = {
+        norm_name: col_name_map_reverse.get(norm_name, norm_name)
+        for norm_name in plot_data.index
+    }
+    
+    # 2. Apply the mapping to the DataFrame index
+    plot_data.index = plot_data.index.map(plot_label_map)
+    
+    # --- End Fix ---
+    
     # Ensure import is inside function if it wasn't global
     import matplotlib.pyplot as plt 
     import io, base64 
     
     plt.figure(figsize=(12, 6))
+    
+    # plot_data.plot uses the index for X-axis labels (now unnormalized)
     plot_data.plot(kind='bar', ax=plt.gca(), width=0.8)
     
     plt.title(f"Actual vs. Predicted Ingredient Usage (Total for {month_to_predict_str})")
     plt.ylabel("Total Usage (Sum)")
     plt.xlabel("Ingredient")
-    plt.xticks(rotation=45, ha='right')
+    plt.xticks(rotation=45, ha='right') # Ticks will use the unnormalized names
     plt.legend(title='Usage Type')
     plt.tight_layout()
 
