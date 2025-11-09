@@ -1753,14 +1753,13 @@ def predict_next_month_usage():
 
 @app.route("/predict_cost_loocv", methods=["POST"])
 def predict_cost_loocv():
-    global item # Use the global item DataFrame
-
+    global item, TARGETS_INGREDIENTS # Included TARGETS_INGREDIENTS for clear global access (assuming it's defined outside)
+    
     if item is None or item.empty:
         return jsonify({"error": "Item data not loaded."}), 400
 
-    # ... (Data preparation and aggregation steps remain the same) ...
-    # Assuming df_agg, X_full, y_full, unique_items, ingredient_cols are correctly defined here.
-
+    # ... (omitted sections 1-3 which prepare df_agg, X_full, y_full, etc.) ...
+    
     df_temp = item.copy()
     col_name_map_forward = {col: normalize_text(col) for col in item.columns}
     df_pred_base = item.copy()
@@ -1800,25 +1799,52 @@ def predict_cost_loocv():
     all_actuals_agg = []
     all_predictions_agg = []
     food_item_labels = []
-    
-    # NEW METRIC STORAGE
     item_mse_list = []
     all_model_coefficients = defaultdict(list)
     
     for item_index, item_value in enumerate(unique_items):
         test_mask = df_agg[food_item_col] == item_value
         
-        X_train = X_full[~test_mask]
-        y_train = y_full[~test_mask]
-        X_test = X_full[test_mask]
-        y_test = y_full[test_mask] 
+        # NOTE: X_train and X_test are COPIED from X_full here
+        X_train = X_full[~test_mask].copy()
+        y_train = y_full[~test_mask].copy()
+        X_test = X_full[test_mask].copy()
+        y_test = y_full[test_mask].copy() 
 
         if X_train.empty or X_test.empty or y_test.empty:
             continue
             
         stable_predictors = [col for col in ingredient_cols if X_train[col].nunique() > 1]
         
-        # --- Stepwise Selection (omitted for brevity, assumes successful feature selection) ---
+        if not stable_predictors:
+            mean_pred = y_train.mean()
+            all_actuals_agg.append(y_test.iloc[0])
+            all_predictions_agg.append(mean_pred)
+            food_item_labels.append(item_value)
+            
+            # Store 0 for coefficients if no features selected
+            for feature in ingredient_cols: # Use all ingredient_cols for coefficient accumulation
+                all_model_coefficients[feature].append(0.0)
+            continue
+            
+        # -----------------------------------------------------------
+        # FEATURE STANDARDIZATION (FIX IMPLEMENTATION)
+        # -----------------------------------------------------------
+        scaler = StandardScaler()
+        
+        # 1. Fit scaler only on the training features that are stable
+        X_train_stable = X_train[stable_predictors]
+        scaler.fit(X_train_stable)
+
+        # 2. Transform both the training and test sets, maintaining structure
+        X_train_scaled_array = scaler.transform(X_train_stable)
+        X_test_scaled_array = scaler.transform(X_test[stable_predictors])
+        
+        # Convert back to DataFrame for sm.OLS compatibility
+        X_train_scaled = pd.DataFrame(X_train_scaled_array, columns=stable_predictors, index=X_train.index)
+        X_test_scaled = pd.DataFrame(X_test_scaled_array, columns=stable_predictors, index=X_test.index)
+        
+        # --- Stepwise Selection (Both Directions, AIC) ---
         selected_features = []
         remaining = list(stable_predictors)
         best_score = float("inf")
@@ -1827,20 +1853,24 @@ def predict_cost_loocv():
             scores_to_add = []
             scores_to_remove = []
             
-            # Forward Step
+            # Forward Step uses X_train_scaled
             for candidate in remaining:
                 try:
                     features = selected_features + [candidate]
-                    model_try = sm.OLS(y_train, sm.add_constant(X_train[features], has_constant="add")).fit()
+                    model_try = sm.OLS(y_train, sm.add_constant(X_train_scaled[features], has_constant="add")).fit()
                     scores_to_add.append((model_try.aic, candidate))
                 except (np.linalg.LinAlgError, Exception): continue
 
-            # Backward Step
+            # Backward Step uses X_train_scaled
             if selected_features:
                 for candidate in selected_features:
                     try:
                         features = [f for f in selected_features if f != candidate]
-                        model_try = sm.OLS(y_train, sm.add_constant(X_train[features], has_constant="add")).fit()
+                        if not features:
+                            # Model with only constant
+                            model_try = sm.OLS(y_train, sm.add_constant(pd.DataFrame(index=X_train.index), has_constant="add")).fit()
+                        else:
+                            model_try = sm.OLS(y_train, sm.add_constant(X_train_scaled[features], has_constant="add")).fit()
                         scores_to_remove.append((model_try.aic, candidate))
                     except (np.linalg.LinAlgError, Exception): continue
 
@@ -1863,33 +1893,35 @@ def predict_cost_loocv():
         
         # --- Final Prediction and Metric Extraction ---
         
-        predicted_cost = y_train.mean() # Default to mean if no features selected
+        predicted_cost = y_train.mean() 
         
         if selected_features:
             try:
-                final_model = sm.OLS(y_train, sm.add_constant(X_train[selected_features], has_constant="add")).fit()
+                final_model = sm.OLS(y_train, sm.add_constant(X_train_scaled[selected_features], has_constant="add")).fit()
                 
-                # STORE COEFFICIENTS (NEW)
-                for feature in stable_predictors:
+                # STORE COEFFICIENTS (NEW): Store coefficients for ALL ingredient columns
+                for feature in ingredient_cols: 
+                    # Store the coefficient if selected, otherwise 0.0
                     if feature in final_model.params:
                         all_model_coefficients[feature].append(final_model.params[feature])
                     else:
-                        all_model_coefficients[feature].append(0.0) # Store 0 if feature not selected
+                        all_model_coefficients[feature].append(0.0)
                 
-                X_test_aligned = sm.add_constant(X_test[selected_features], has_constant="add")
+                # Prepare test data with constant and feature alignment
+                X_test_aligned = sm.add_constant(X_test_scaled[selected_features], has_constant="add")
                 X_test_aligned = X_test_aligned.reindex(columns=final_model.model.exog_names, fill_value=0.0).astype(float)
                 
                 preds = final_model.predict(X_test_aligned)
-                predicted_cost = preds.iloc[0] # Single predicted value
+                predicted_cost = preds.iloc[0] 
                 
             except Exception:
                 predicted_cost = y_train.mean() 
                 # Store 0 for coefficients if model failed
-                for feature in stable_predictors:
+                for feature in ingredient_cols:
                     all_model_coefficients[feature].append(0.0)
         else:
              # Store 0 for coefficients if no features selected
-             for feature in stable_predictors:
+             for feature in ingredient_cols:
                  all_model_coefficients[feature].append(0.0)
 
         actual_cost = y_test.iloc[0]
@@ -1898,10 +1930,13 @@ def predict_cost_loocv():
         all_predictions_agg.append(predicted_cost)
         food_item_labels.append(item_value)
         
-        # Calculate Item-specific MSE (NEW)
         item_mse = mean_squared_error([actual_cost], [predicted_cost])
         item_mse_list.append({'Item': item_value, 'MSE': item_mse})
 
+    # ... (sections 3, 4, 5, and 6 remain the same) ...
+    # This ensures that the final aggregate metrics, plotting, and coefficient table creation
+    # use the data generated by the standardized models.
+    
     # Convert lists to NumPy arrays for final metric calculation
     actual_array = np.array(all_actuals_agg)
     pred_array = np.array(all_predictions_agg)
@@ -1914,11 +1949,9 @@ def predict_cost_loocv():
     final_variance = final_variance_base
     final_explained_variance = 1 - (final_mse / final_variance) if final_variance != 0 else 0.0
 
-    # --- 4. Coefficient and Plot Data Preparation ---
-    
     # 4a. Average Coefficients Table (NEW)
     avg_coefficients = {}
-    for feature in stable_predictors:
+    for feature in ingredient_cols:
         avg_coefficients[feature] = np.mean(all_model_coefficients[feature])
         
     coefficient_table = []
@@ -1988,7 +2021,7 @@ def predict_cost_loocv():
         "note": "Cost prediction completed",
         "coefficient_table": coefficient_table # <-- NEW TABLE DATA
     })
-
+    
 
 def normalize_text(s):
     """Normalizes text by removing non-alphanumeric chars and converting to lowercase."""
