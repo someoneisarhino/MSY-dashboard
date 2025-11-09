@@ -3,6 +3,10 @@ For TAMU Datathon
 
 To run this, a folder named 'data' needs to be created with the appropriate data files added. I didn't include this file in the repo because I wasn't sure how public the data is.
 
+In addition, an Gemini API key must be stored in a .env file in the structure GEMINI_API_KEY = "" for the chatbot to be initialized.
+
+
+
 Mai KitShan was built to reorganize Ma Shan Yun's inventory such that it is easier to interpret and analyze. It provides several features:
 
 1. Usage Comparison: Users will be able to see how the previous months usage of an ingredient compares to the actual usage of that ingredient in the current month.
